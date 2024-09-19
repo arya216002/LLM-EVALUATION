@@ -1,13 +1,25 @@
 import mlflow
 import pandas as pd
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import nltk
+from nltk.translate.bleu_score import sentence_bleu
 from langchain_community.llms import CTransformers
 from langchain_core.prompts import PromptTemplate
 from langchain.chains import LLMChain
 import os
+import dagshub
 
-# Create singleton instances for models
+dagshub.init(repo_owner='aryaprajeesh16.10.02', repo_name='MLFlow', mlflow=True)
+
+mlflow.set_tracking_uri("https://dagshub.com/aryaprajeesh16.10.02/MLFlow.mlflow")
+
+# Load models for coherence and BLEU
+nltk.download('punkt')
+model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+
+# Create a singleton LLM instance
 llm_instance = None
-judge_model_instance = None
 
 def get_llm():
     global llm_instance
@@ -20,88 +32,113 @@ def get_llm():
         )
     return llm_instance
 
-def get_judge_model():
-    global judge_model_instance
-    if judge_model_instance is None:
-        judge_model_instance = CTransformers(
-            model="TheBloke/Llama-2-7B-Chat-GGUF",
-            model_file="llama-2-7b-chat.Q4_K_M.gguf",
-            model_type="llama",
-            config={'max_new_tokens': 128, 'temperature': 0.7}
-        )
-    return judge_model_instance
+# Coherence score (cosine similarity)
+def coherence_score(user_input, response):
+    input_embedding = model.encode([user_input])
+    response_embedding = model.encode([response])
+    similarity = cosine_similarity(input_embedding, response_embedding)[0][0]
+    return similarity
 
-# Define pre-canned metrics
-def get_pre_canned_metrics():
-    return [
-        mlflow.metrics.genai.answer_similarity(),
-        mlflow.metrics.genai.answer_correctness(),
-        mlflow.metrics.genai.answer_relevance(),
-        mlflow.metrics.genai.relevance(),
-        mlflow.metrics.genai.faithfulness()
-    ]
+# BLEU score
+def compute_bleu(reference_response, generated_response):
+    reference_tokens = [nltk.word_tokenize(reference_response.lower())]
+    generated_tokens = nltk.word_tokenize(generated_response.lower())
+    bleu_score = sentence_bleu(reference_tokens, generated_tokens)
+    return bleu_score
 
-# Function to evaluate responses
-def evaluate_response(user_input, response):
-    judge_model = get_judge_model()
+# ARI score calculation using the provided formula
+def ari_score(text):
+    # Count characters, words, and sentences
+    characters = len(text)  # Simplified character count
+    words = len(text.split())
+    sentences = text.count('.') + text.count('!') + text.count('?')
+    
+    # Print debug information
+    print(f"Characters: {characters}, Words: {words}, Sentences: {sentences}")
+    
+    # Check if sentences or words are zero to avoid division by zero
+    if sentences == 0 or words == 0:
+        return float('inf')  # Represents unreadable text
+    
+    # Calculate ARI score using the provided formula
+    ari = 4.71 * (characters / words) + 0.5 * (words / sentences) - 21.43
+    
+    # Ensure ARI is non-negative
+    ari = max(ari, 0)
+    
+    # Print final ARI score for debugging
+    print(f"Calculated ARI Score: {ari}")
+    
+    return ari
 
-    # Prepare evaluation data
-    data = {
-        'input': [user_input],
-        'output': [response],
-        'ground_truth': [user_input]
-    }
-    
-    # Convert to DataFrame
-    df = pd.DataFrame(data)
-    
-    # Evaluate response
-    evaluation_results = mlflow.evaluate(
-        model=judge_model,
-        data=df,
-        extra_metrics=get_pre_canned_metrics()
-    )
-    
-    return evaluation_results
+# # Placeholder sentiment analysis function
+# def sentiment_analysis(text):
+#     # Dummy sentiment score; replace with actual sentiment analysis
+#     return len(text) % 10
 
-# Function to append data to an Excel file
-def append_to_excel(data, file_name="chatbot_responses_mlflow.xlsx"):
-    if os.path.exists(file_name):
-        existing_data = pd.read_excel(file_name)
-        new_data = pd.concat([existing_data, data], ignore_index=True)
-        new_data.to_excel(file_name, index=False)
-    else:
-        data.to_excel(file_name, index=False)
+# Diversity score (Token uniqueness)
+def diversity_score(response):
+    tokens = response.split()
+    unique_tokens = len(set(tokens))
+    diversity = unique_tokens / len(tokens) if tokens else 0
+    return diversity
 
-# Function to evaluate responses and log results to MLflow
-def evaluate_and_log_to_mlflow(user_input, response):
-    evaluation_results = evaluate_response(user_input, response)
+# # Empathy score placeholder
+# def empathy_score(response):
+#     # Dummy empathy score; replace with an actual empathy model
+#     return len(response) % 5
+
+# Function to evaluate responses and log the results to MLflow
+def evaluate_and_log_to_mlflow(user_input, response, reference_response):
+    response_length = len(response.split())
+    # sentiment = sentiment_analysis(response)
+    coherence = coherence_score(user_input, response)
+    bleu = compute_bleu(reference_response, response)
+    diversity = diversity_score(response)
+    # empathy = empathy_score(response)
+    ari = ari_score(response)
     
-    metrics = {
-        "answer_similarity": evaluation_results.get('answer_similarity', 0),
-        "answer_correctness": evaluation_results.get('answer_correctness', 0),
-        "answer_relevance": evaluation_results.get('answer_relevance', 0),
-        "relevance": evaluation_results.get('relevance', 0),
-        "faithfulness": evaluation_results.get('faithfulness', 0)
-    }
-    
+    # Log the metrics in MLflow
     with mlflow.start_run():
-        for metric_name, metric_value in metrics.items():
-            mlflow.log_metric(metric_name, metric_value)
+        mlflow.log_param("user_input", user_input)
+        mlflow.log_metric("response_length", response_length)
+        # mlflow.log_metric("sentiment_score", sentiment)
+        mlflow.log_metric("coherence", coherence)
+        mlflow.log_metric("bleu_score", bleu)
+        mlflow.log_metric("diversity_score", diversity)
+        # mlflow.log_metric("empathy_score", empathy)
+        mlflow.log_metric("ari_score", ari)
     
-    data = {
+    # Prepare new data
+    new_data = {
         "User Input": [user_input],
         "Response": [response],
-        "Answer Similarity": [metrics["answer_similarity"]],
-        "Answer Correctness": [metrics["answer_correctness"]],
-        "Answer Relevance": [metrics["answer_relevance"]],
-        "Relevance": [metrics["relevance"]],
-        "Faithfulness": [metrics["faithfulness"]]
+        "Response Length": [response_length],
+        # "Sentiment Score": [sentiment],
+        "Coherence": [coherence],
+        "BLEU Score": [bleu],
+        "Diversity Score": [diversity],
+        # "Empathy Score": [empathy],
+        "ARI Score": [ari]
     }
-    df = pd.DataFrame(data)
-    append_to_excel(df)
+    new_df = pd.DataFrame(new_data)
+    
+    # File path
+    file_path = "chatbot_responses.xlsx"
+    
+    if os.path.exists(file_path):
+        # Load existing data
+        existing_df = pd.read_excel(file_path)
+        # Append new data
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+    else:
+        # No existing file, so just use the new data
+        combined_df = new_df
+    
+    # Save combined data to Excel
+    combined_df.to_excel(file_path, index=False)
 
-# Function to generate responses
+# Function to generate chatbot responses
 def generate_response(user_input):
     llm = get_llm()
     
@@ -111,7 +148,11 @@ def generate_response(user_input):
     
     response = llm_chain.run(user_input)
     
-    evaluate_and_log_to_mlflow(user_input, response)
+    # Reference response is needed for BLEU; in real settings, replace with actual reference.
+    reference_response = user_input  # Placeholder for real reference response
+    
+    # Log response evaluation
+    evaluate_and_log_to_mlflow(user_input, response, reference_response)
     
     return response
 
